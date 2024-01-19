@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/gorilla/mux"
@@ -19,7 +21,7 @@ var store = LockableStore{
 	m: make(map[string]string),
 }
 
-var logger TransactionLogger
+var transact TransactionLogger
 
 var ErrNoSuchKey = errors.New("key doesn not exist")
 
@@ -54,10 +56,9 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 
 func Put(key, value string) error {
 	store.Lock()
-	defer store.RWMutex.Unlock()
+	defer store.Unlock()
 
 	store.m[key] = value
-	logger.WritePut(key, value)
 
 	return nil
 }
@@ -78,38 +79,61 @@ func Delete(key string) error {
 	defer store.Unlock()
 
 	delete(store.m, key)
-	logger.WriteDelete(key)
 
 	return nil
 }
 
 func initializeTransactionLog() error {
 	var err error
+	pgHost := os.Getenv("PG_HOST")
+	dbName := os.Getenv("DB_NAME")
+	pgUser := os.Getenv("PG_USER")
+	pgPassword := os.Getenv("PG_PASSWORD")
 
-	logger, err = NewFileTransactionLogger("transaction.log")
+	transact, err = NewPostgresTransactionLogger(
+		PostgresDBParams{
+			host:     pgHost,
+			dbName:   dbName,
+			user:     pgUser,
+			password: pgPassword,
+		},
+	)
+
+	// logger, err = NewFileTransactionLogger("transaction.log")
 	if err != nil {
-		return fmt.Errorf("failed to create event logger: %w", err)
+		return fmt.Errorf("failed to create transaction logger: %w", err)
 	}
 
-	events, errors := logger.ReadEvents()
-
-	e := Event{}
-	ok := true
+	events, errors := transact.ReadEvents()
+	count, ok, e := 0, true, Event{}
 
 	for ok && err == nil {
 		select {
-		case err, ok = <-errors: // Retrieve any errors
+		case err, ok = <-errors:
+
 		case e, ok = <-events:
+			fmt.Printf("Event: %v\n", e)
 			switch e.EventType {
 			case EventDelete: // Got a DELETE event!
 				err = Delete(e.Key)
+				count++
 			case EventPut: // Got a PUT event!
+				fmt.Printf("Putting %v\n", e.Value)
 				err = Put(e.Key, e.Value)
+				count++
 			}
 		}
 	}
 
-	logger.Run()
+	log.Printf("%d events replayed\n", count)
+
+	transact.Run()
+
+	go func() {
+		for err := range transact.Err() {
+			log.Print(err)
+		}
+	}()
 
 	return err
 }
